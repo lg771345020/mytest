@@ -1,0 +1,290 @@
+package com.greenet.api.mina.core;
+
+import com.greenet.api.dao.alarm.IAlarmDao;
+import com.greenet.api.jms.ISendToJms;
+import com.greenet.api.mina.TelnetStart;
+import com.greenet.api.mina.cmd.AbstractCommand;
+import com.greenet.api.mina.cmd.MutiCommand;
+import com.greenet.api.mina.codec.TelnetCodecFactory;
+import com.greenet.api.model.telnet.DeviceBean;
+import com.greenet.api.telnet.internal.TelnetBundleHelper;
+import org.apache.mina.core.future.ConnectFuture;
+import org.apache.mina.core.future.ReadFuture;
+import org.apache.mina.core.future.WriteFuture;
+import org.apache.mina.core.service.IoConnector;
+import org.apache.mina.core.session.IoSession;
+import org.apache.mina.core.session.IoSessionConfig;
+import org.apache.mina.filter.codec.ProtocolCodecFilter;
+import org.apache.mina.transport.socket.nio.NioSocketConnector;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.net.InetSocketAddress;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * @author leigang
+ * @version 2018-04-25
+ */
+public class TelnetConncetion extends TelnetStringSupport {
+
+    private static Logger logger = LoggerFactory.getLogger(TelnetConncetion.class);
+    protected IAlarmDao iAlarmDao = (IAlarmDao) TelnetBundleHelper.getBean("alarmDaoImpl");
+    protected ISendToJms iSendToJms = TelnetBundleHelper.getService(ISendToJms.class);
+
+    private Object lock = new Object();
+    private boolean isFirstConnected = true;
+
+    protected DeviceBean device;
+    protected int deviceId;
+    protected String ip;
+    protected int port;
+    protected String username;
+    protected String password;
+
+    private IoSession session = null;
+    private IoConnector connector = null;
+
+    // 设备连接状态，注意同步请求 session 关闭时状态仍为 Connected ，最好先调用 isConnected 判断设备是否连接
+    private ConnectionState state = ConnectionState.DisConnected;
+    // 设备登陆连续失败的次数，大于3次，认为设备失联
+    private int failLoginTimes = 0;
+
+    public TelnetConncetion() {
+        // 创建一个非阻塞的客户端程序
+        connector = new NioSocketConnector();
+        // 设置链接超时时间
+        connector.setConnectTimeout(30000);
+
+        IoSessionConfig cfg = connector.getSessionConfig();
+        cfg.setUseReadOperation(true);
+        cfg.setReadBufferSize(2 * 1024 * 1024);
+
+        // 添加过滤器
+        connector.getFilterChain().addLast(
+                "codec",
+                new ProtocolCodecFilter(new TelnetCodecFactory()));
+        // 添加业务逻辑处理器类，异步处理
+        connector.setHandler(new TelnetClientHandler(this));
+    }
+
+    public TelnetConncetion(DeviceBean device) {
+        this(device.getDeviceId(), device.getDevice_ip(), device.getPort(), device.getUsername(), device.getPassword());
+        this.device = device;
+    }
+
+    public TelnetConncetion(int deviceId, String ip, int port, String username, String password) {
+        this();
+        this.deviceId = deviceId;
+        this.ip = ip;
+        this.port = port;
+        this.username = username;
+        this.password = password;
+    }
+
+
+    public boolean connect() {
+        return connect(ip, port, username, password);
+    }
+
+    public boolean connect(String ip, int port, String username, String password) {
+        if (state == ConnectionState.Connected || state == ConnectionState.Connecting) {
+            return true;
+        }
+
+        // 连接
+        try {
+            state = ConnectionState.Connecting;
+
+            ConnectFuture future = connector.connect(new InetSocketAddress(ip, port));// 创建连接
+            future.awaitUninterruptibly(1000, TimeUnit.SECONDS);      // 等待连接创建完成
+            session = future.getSession();      // 获得session
+        } catch (Exception e) {
+            ;
+        } finally {
+            if (session == null) {
+                disconnect();
+                return false;
+            }
+        }
+
+        // 登陆，1s 内没有结果返回则认为登陆失败
+        boolean isLogin = false;
+        try {
+            session.write(TelenetConfigBuffer.getNegotiateBuffer());
+
+            String loginResult = sendSync(String.format("%s\n%s", username, password), 1);
+            isLogin = loginResult != null;
+        } catch (Exception e) {
+            ;
+        } finally {
+            if (isLogin) {
+                loginSucessed();
+            } else {
+                disconnect();
+            }
+            return isLogin;
+        }
+    }
+
+    // 连接正常则返回true，与是否登陆无关。若登陆失败时连接还没有关闭也会返回true
+    public boolean isConnected() {
+        boolean isConnected = this.session != null && this.session.isConnected();
+        if (!isConnected) {
+            state = ConnectionState.DisConnected;
+            //logger.error(ip + " 连接已经断开...");
+        }
+        return isConnected;
+    }
+
+    public IoSession getSession() {
+        return session;
+    }
+
+    // 同步发送，默认5秒未读到数据则超时。
+    public String sendSync(String cmd) {
+        return sendSync(cmd, 5);
+    }
+
+    // 同步发送，可以指定超时时间，单位秒
+    public String sendSync(String cmd, int time) {
+        synchronized (lock) {
+            if (isConnected()) {
+                // 发送
+                session.write(cmd).awaitUninterruptibly();
+                // 接收
+                ReadFuture readFuture = session.read();
+                if (readFuture.awaitUninterruptibly(time, TimeUnit.SECONDS)) {
+                    String message = (String) readFuture.getMessage();
+                    return message;
+                } else {
+                    throw new RuntimeException(String.format("下发 %s 命令读取超时", displayCmd(cmd)));
+                }
+            }
+            throw new RuntimeException(String.format("设备 %s 连接断开，下发 %s 命令失败", ip, displayCmd(cmd)));
+        }
+    }
+
+    // 异步发送数据
+    public boolean send(String cmd) {
+        WriteFuture rs = session.write(cmd);
+        try {
+            rs.await();
+            logger.info(String.format("client sent %s success", displayCmd(cmd)));
+        } catch (InterruptedException e) {
+            logger.error(String.format("client sent %s error", displayCmd(cmd)), e);
+            return false;
+        }
+        return rs.isWritten();
+    }
+
+
+    // 登陆成功后处理
+    public void loginSucessed(){
+        synchronized (lock) {
+            if (failLoginTimes >= 3 || isFirstConnected) {
+                // 登陆成功后进行同步数据等操作
+                MutiCommand.initConnectTask(getDeviceId()).execute();
+                if (isFirstConnected) {
+                    isFirstConnected = false;
+                }
+            }
+
+            failLoginTimes = 0;
+            state = ConnectionState.Connected;
+            // 登陆成功后结束当前的离线告警，如果存在的话
+            iAlarmDao.endOffAlarm(getDeviceId());
+            logger.info(String.format("telnet %s:%s %s:%s 登陆成功", ip, port, username, password));
+        }
+    }
+
+    // 关闭会话 session
+    public void disconnect(){
+        synchronized (lock) {
+            this.state = ConnectionState.DisConnected;
+            logger.error(String.format("telnet %s:%s %s:%s 连续第 %s 连接失败", ip, port, username, password, ++failLoginTimes));
+            // 连续 3 次登陆失败才产生一条离线的告警
+            if (failLoginTimes == 3) {
+                iAlarmDao.createOffAlarm(getDeviceId());
+            }
+            if (session != null) {
+                session.close(true);
+                session = null;
+            }
+        }
+    }
+
+    // 关闭整个连接 session and connector
+    public void close() {
+        synchronized (lock) {
+            state = ConnectionState.DisConnected;
+
+            if (connector != null) {
+                connector.dispose();
+                connector = null;
+            }
+            if (session != null) {
+                session.close(true);
+                session = null;
+            }
+        }
+    }
+
+    public int getDeviceId() {
+        return deviceId;
+    }
+
+    public void setDeviceId(int deviceId) {
+        this.deviceId = deviceId;
+    }
+
+    public String getIp() {
+        return ip;
+    }
+
+    public void setIp(String ip) {
+        this.ip = ip;
+    }
+
+    public int getPort() {
+        return port;
+    }
+
+    public void setPort(int port) {
+        this.port = port;
+    }
+
+    public String getUsername() {
+        return username;
+    }
+
+    public void setUsername(String username) {
+        this.username = username;
+    }
+
+    public String getPassword() {
+        return password;
+    }
+
+    public void setPassword(String password) {
+        this.password = password;
+    }
+
+    public ConnectionState getState() {
+        return state;
+    }
+
+    public void setState(ConnectionState state) {
+        this.state = state;
+    }
+
+    public int getFailLoginTimes() {
+        return failLoginTimes;
+    }
+
+    public void setFailLoginTimes(int failLoginTimes) {
+        this.failLoginTimes = failLoginTimes;
+    }
+
+}
